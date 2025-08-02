@@ -1,111 +1,94 @@
-from flask import Flask, request, redirect, render_template_string, flash
-import psycopg2
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.responses import RedirectResponse, HTMLResponse
+from pydantic import BaseModel, HttpUrl
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
 import hashlib
 import string
 import random
+import os
+from urllib.parse import urlparse
+from typing import Optional
 
-app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Replace with a secure key
+# Initialize FastAPI app
+app = FastAPI(title="URL Shortener Service")
 
-# Database connection configuration
-DB_CONFIG = {
-    'dbname': 'url_shortener',
-    'user': 'postgres',
-    'password': '',  # Replace with your PostgreSQL password
-    'host': 'localhost',
-    'port': '5432'
-}
+# Environment variables for configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:@localhost:5432/url_shortener")
+SHORT_CODE_LENGTH = int(os.getenv("SHORT_CODE_LENGTH", "7"))  # Ensure default is a string "7"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+
+# SQLAlchemy setup
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=10)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Database model
+class URL(Base):
+    __tablename__ = "urls"
+    id = Column(Integer, primary_key=True, index=True)
+    original_url = Column(String, nullable=False)
+    short_code = Column(String, unique=True, index=True, nullable=False)
 
 # Initialize database
 def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS urls (
-            id SERIAL PRIMARY KEY,
-            original_url TEXT NOT NULL,
-            short_code TEXT UNIQUE NOT NULL
-        )
-    ''')
-    conn.commit()
-    cursor.close()
-    conn.close()
+    Base.metadata.create_all(bind=engine)
+
+# Dependency for database session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Pydantic model for input validation
+class URLRequest(BaseModel):
+    url: HttpUrl
 
 # Generate short code
-def generate_short_code(url):
-    # Use first 7 characters of MD5 hash
+def generate_short_code(url: str) -> str:
     hash_object = hashlib.md5(url.encode())
-    return hash_object.hexdigest()[:7]
+    return hash_object.hexdigest()[:SHORT_CODE_LENGTH]
 
 # Generate random short code as fallback
-def generate_random_code():
+def generate_random_code() -> str:
     characters = string.ascii_letters + string.digits
-    return ''.join(random.choice(characters) for _ in range(7))
+    return ''.join(random.choice(characters) for _ in range(SHORT_CODE_LENGTH))
 
-# Home route with form
-@app.route('/', methods=['GET', 'POST'])
-def home():
-    if request.method == 'POST':
-        original_url = request.form.get('url')
-        if not original_url:
-            flash('URL is required!')
-            return redirect('/')
-        
-        # Ensure URL starts with http:// or https://
-        if not original_url.startswith(('http://', 'https://')):
-            original_url = 'http://' + original_url
-            
-        conn = psycopg2.connect(**DB_CONFIG)
-        cursor = conn.cursor()
-        
-        # Try to generate unique short code
-        short_code = generate_short_code(original_url)
-        try:
-            cursor.execute('INSERT INTO urls (original_url, short_code) VALUES (%s, %s)',
-                          (original_url, short_code))
-            conn.commit()
-        except psycopg2.IntegrityError:
-            # If short code exists, try random code
-            short_code = generate_random_code()
-            cursor.execute('INSERT INTO urls (original_url, short_code) VALUES (%s, %s)',
-                          (original_url, short_code))
-            conn.commit()
-        finally:
-            cursor.close()
-            conn.close()
-                
-        short_url = request.url_root + short_code
-        return render_template_string('''
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>URL Shortener</title>
-                <style>
-                    body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-                    .message { color: green; }
-                    input[type=text] { width: 100%; padding: 8px; margin: 10px 0; }
-                    input[type=submit] { padding: 8px 16px; }
-                </style>
-            </head>
-            <body>
-                <h1>URL Shortener</h1>
-                {% with messages = get_flashed_messages() %}
-                    {% if messages %}
-                        <div class="message">{{ messages[0] }}</div>
-                    {% endif %}
-                {% endwith %}
-                <form method="post">
-                    <input type="text" name="url" placeholder="Enter URL to shorten">
-                    <input type="submit" value="Shorten">
-                </form>
-                {% if short_url %}
-                    <p>Shortened URL: <a href="{{ short_url }}">{{ short_url }}</a></p>
-                {% endif %}
-            </body>
-            </html>
-        ''', short_url=short_url)
+# Create short URL
+@app.post("/shorten", status_code=status.HTTP_201_CREATED)
+async def shorten_url(url_request: URLRequest, db: Session = Depends(get_db)):
+    original_url = str(url_request.url)
+    short_code = generate_short_code(original_url)
     
-    return render_template_string('''
+    for _ in range(3):  # Retry up to 3 times for unique short code
+        db_url = URL(original_url=original_url, short_code=short_code)
+        try:
+            db.add(db_url)
+            db.commit()
+            db.refresh(db_url)
+            return {"short_url": f"{BASE_URL}/{short_code}", "original_url": original_url}
+        except IntegrityError:
+            db.rollback()
+            short_code = generate_random_code()
+    
+    raise HTTPException(status_code=500, detail="Failed to generate unique short code")
+
+# Redirect to original URL
+@app.get("/{short_code}", response_class=RedirectResponse)
+async def redirect_url(short_code: str, db: Session = Depends(get_db)):
+    db_url = db.query(URL).filter(URL.short_code == short_code).first()
+    if not db_url:
+        raise HTTPException(status_code=404, detail="Short URL not found")
+    return RedirectResponse(db_url.original_url)
+
+# Optional HTML frontend
+@app.get("/", response_class=HTMLResponse)
+async def get_frontend():
+    return """
         <!DOCTYPE html>
         <html>
         <head>
@@ -113,42 +96,53 @@ def home():
             <style>
                 body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
                 .message { color: green; }
+                .error { color: red; }
                 input[type=text] { width: 100%; padding: 8px; margin: 10px 0; }
                 input[type=submit] { padding: 8px 16px; }
             </style>
+            <script>
+                async function shortenUrl() {
+                    const urlInput = document.getElementById('url').value;
+                    const resultDiv = document.getElementById('result');
+                    const errorDiv = document.getElementById('error');
+                    resultDiv.innerHTML = '';
+                    errorDiv.innerHTML = '';
+                    
+                    try {
+                        const response = await fetch('/shorten', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({url: urlInput})
+                        });
+                        const data = await response.json();
+                        if (response.ok) {
+                            resultDiv.innerHTML = `Shortened URL: <a href="${data.short_url}">${data.short_url}</a>`;
+                        } else {
+                            errorDiv.innerHTML = data.detail;
+                        }
+                    } catch (err) {
+                        errorDiv.innerHTML = 'Failed to shorten URL';
+                    }
+                }
+            </script>
         </head>
         <body>
             <h1>URL Shortener</h1>
-            {% with messages = get_flashed_messages() %}
-                {% if messages %}
-                    <div class="message">{{ messages[0] }}</div>
-                {% endif %}
-            {% endwith %}
-            <form method="post">
-                <input type="text" name="url" placeholder="Enter URL to shorten">
+            <div id="error" class="error"></div>
+            <form onsubmit="event.preventDefault(); shortenUrl();">
+                <input type="text" id="url" placeholder="Enter URL to shorten">
                 <input type="submit" value="Shorten">
             </form>
+            <div id="result"></div>
         </body>
         </html>
-    ''')
+    """
 
-# Redirect route
-@app.route('/<short_code>')
-def redirect_url(short_code):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cursor = conn.cursor()
-    cursor.execute('SELECT original_url FROM urls WHERE short_code = %s', (short_code,))
-    result = cursor.fetchone()
-    
-    cursor.close()
-    conn.close()
-    
-    if result:
-        return redirect(result[0])
-    else:
-        flash('Invalid short URL!')
-        return redirect('/')
-
-if __name__ == '__main__':
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
     init_db()
-    app.run(debug=True)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
